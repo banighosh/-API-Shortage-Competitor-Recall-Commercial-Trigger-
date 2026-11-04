@@ -1,0 +1,805 @@
+{
+  "name": "Pharma | API Shortage & Competitor Recall Commercial Trigger",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "56e7eabb-6d4b-5ef3-9097-766d3a2da741",
+      "name": "Daily Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "06:30 America/New_York, daily",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Build Query Window ───────────────────────────────────────────────────────\n// FDA publishes the Enforcement Report weekly, so a daily poll uses a 7-day\n// look-back. Re-seen events are harmless: the database de-dup key blocks any\n// second pitch for the same event x SKU.\nconst LOOKBACK_DAYS = 7;\n\nconst now = new Date();\nconst from = new Date(now.getTime() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000);\nconst yyyymmdd = (d) => d.toISOString().slice(0, 10).replace(/-/g, '');\n\nreturn [{\n  json: {\n    run_id: 'RUN-' + now.toISOString().replace(/[-:T]/g, '').slice(0, 14),\n    run_started_at: now.toISOString(),\n    lookback_days: LOOKBACK_DAYS,\n    from_date: yyyymmdd(from),\n    to_date: yyyymmdd(now),\n    window_start_iso: from.toISOString(),\n    // openFDA Lucene-style query; n8n URL-encodes spaces as \"+\"\n    enforcement_search: `report_date:[${yyyymmdd(from)} TO ${yyyymmdd(now)}]`,\n    shortage_search: 'status:\"Current\"',\n    // Manual test runs use pinned demo data whose dates are fixed, so the\n    // shortage date filter is relaxed for 'test' executions only.\n    is_test_run: $execution.mode === 'test',\n  },\n}];"
+      },
+      "id": "e6f3febe-3cc6-5e3c-b961-25118ae2fda7",
+      "name": "Build Query Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "7-day look-back + run_id",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT array_agg(DISTINCT lower(molecule_name) ORDER BY lower(molecule_name)) AS molecules\nFROM internal_sku_inventory\nWHERE is_active;",
+        "options": {}
+      },
+      "id": "fc849826-e398-5bdd-a6fc-e9766b43905d",
+      "name": "Load Portfolio Molecules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Active molecules for the pre-LLM relevance filter",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "url": "https://api.fda.gov/drug/enforcement.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "={{ $('Build Query Window').first().json.enforcement_search }}"
+            },
+            {
+              "name": "limit",
+              "value": "1000"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "335c9778-c224-5ba5-ac41-fbccda6e9846",
+      "name": "OpenFDA Enforcement",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "notes": "Recalls reported in the window (404 = none, handled)",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "url": "https://api.fda.gov/drug/shortages.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "={{ $('Build Query Window').first().json.shortage_search }}"
+            },
+            {
+              "name": "limit",
+              "value": "1000"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "3593663c-2b1b-516d-b642-809fd802910c",
+      "name": "OpenFDA Shortages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Current FDA shortage listings",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Normalize & Pre-Filter Events ────────────────────────────────────────────\n// 1. Flattens openFDA enforcement + shortage results into one event list.\n// 2. Deterministic pre-filter BEFORE the LLM: Class I/II, ongoing, inside the\n//    window, and the product must mention a molecule in our active portfolio.\n//    This keeps LLM spend proportional to commercial relevance.\nconst MAX_EVENTS_PER_RUN = 40;            // LLM cost guardrail\nconst RELEVANT_CLASSES = ['Class I', 'Class II'];\n\nconst win = $('Build Query Window').first().json;\nconst portfolio = ($('Load Portfolio Molecules').first().json.molecules || []).filter(Boolean);\nconst enf = $('OpenFDA Enforcement').first().json || {};\nconst sho = $('OpenFDA Shortages').first().json || {};\n\nconst escRe = (s) => s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\nconst stems = [...new Set(portfolio.map((m) => String(m).toLowerCase().split(/\\s+/)[0]))];\nconst portfolioRe = stems.length ? new RegExp(`\\\\b(${stems.map(escRe).join('|')})\\\\b`, 'i') : null;\nconst inPortfolio = (text) => (portfolioRe ? portfolioRe.test(text || '') : false);\n\n// openFDA shortage dates are MM/DD/YYYY\nconst parseUsDate = (s) => {\n  const m = /^(\\d{2})\\/(\\d{2})\\/(\\d{4})$/.exec(String(s || '').trim());\n  return m ? new Date(Date.UTC(+m[3], +m[1] - 1, +m[2])) : null;\n};\nconst windowStart = new Date(win.window_start_iso);\n\nconst events = new Map();\nlet seen = 0;\n\nfor (const r of enf.results || []) {\n  seen++;\n  if (!RELEVANT_CLASSES.includes(r.classification)) continue;\n  if (r.status && r.status !== 'Ongoing') continue;\n  const generic = ((r.openfda || {}).generic_name || []).join(' ');\n  if (!inPortfolio(`${r.product_description} ${generic}`)) continue;\n  events.set(r.recall_number, {\n    source_type: 'FDA_ENFORCEMENT',\n    source_event_id: r.recall_number,\n    recall_classification: r.classification,\n    recalling_firm: r.recalling_firm || '',\n    reason: r.reason_for_recall || '',\n    report_date: r.report_date || '',\n    llm_input_text: [\n      `SOURCE: FDA_ENFORCEMENT | RECALL_NUMBER: ${r.recall_number} | CLASS: ${r.classification}`,\n      `RECALLING_FIRM: ${r.recalling_firm || ''}`,\n      `PRODUCT_DESCRIPTION: ${r.product_description || ''}`,\n      `CODE_INFO: ${r.code_info || ''}`,\n      `REASON_FOR_RECALL: ${r.reason_for_recall || ''}`,\n      `DISTRIBUTION_PATTERN: ${r.distribution_pattern || ''}`,\n    ].join('\\n'),\n  });\n}\n\nfor (const r of sho.results || []) {\n  seen++;\n  const updated = parseUsDate(r.update_date) || parseUsDate(r.initial_posting_date);\n  if (!win.is_test_run && updated && updated < windowStart) continue;\n  const generic = ((r.openfda || {}).generic_name || []).join(' ');\n  if (!inPortfolio(`${r.generic_name} ${r.presentation} ${generic}`)) continue;\n  const id = `SHORTAGE:${r.package_ndc}:${r.update_date || r.initial_posting_date}`;\n  events.set(id, {\n    source_type: 'FDA_SHORTAGE',\n    source_event_id: id,\n    recall_classification: null,\n    recalling_firm: r.company_name || '',\n    reason: r.shortage_reason || r.availability || '',\n    report_date: r.update_date || '',\n    llm_input_text: [\n      `SOURCE: FDA_SHORTAGE | STATUS: ${r.status || ''} | AVAILABILITY: ${r.availability || ''}`,\n      `COMPANY: ${r.company_name || ''}`,\n      `GENERIC_NAME: ${r.generic_name || ''}`,\n      `PRESENTATION: ${r.presentation || ''}`,\n      `PACKAGE_NDC: ${r.package_ndc || ''}`,\n      `SHORTAGE_REASON: ${r.shortage_reason || ''}`,\n      'DISTRIBUTION_PATTERN: FDA national shortage list (nationwide)',\n    ].join('\\n'),\n  });\n}\n\nconst out = [...events.values()].slice(0, MAX_EVENTS_PER_RUN).map((e) => ({\n  json: { ...e, run_id: win.run_id },\n}));\n\nconsole.log(`openFDA records scanned: ${seen} | portfolio-relevant events sent to LLM: ${out.length}`);\nreturn out; // zero items => the workflow ends quietly (nothing relevant today)"
+      },
+      "id": "a0cb4e9b-5a55-5538-bfaa-5b37d4b4c8cf",
+      "name": "Normalize & Pre-Filter Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ],
+      "notes": "Class I/II, ongoing, portfolio molecules only",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.llm_input_text }}",
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"products\": {\n      \"type\": \"array\",\n      \"description\": \"One entry per distinct NDC printed in the FDA record\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"generic_name\": { \"type\": \"string\", \"description\": \"Active ingredient, lower case, salt form kept (e.g. albuterol sulfate)\" },\n          \"strength_norm\": { \"type\": \"string\", \"description\": \"Upper case, no spaces, e.g. 1MG/ML or 2.5MG/3ML\" },\n          \"dosage_form\": { \"type\": \"string\", \"description\": \"Upper case, e.g. INJECTION\" },\n          \"ndc_raw\": { \"type\": \"string\", \"description\": \"NDC exactly as printed, empty string if none\" },\n          \"ndc_11\": { \"type\": \"string\", \"description\": \"HIPAA 5-4-2 with hyphens, empty string if ambiguous or missing\" },\n          \"ndc_source_format\": {\n            \"type\": \"string\",\n            \"enum\": [\"4-4-2\", \"5-3-2\", \"5-4-1\", \"5-4-2\", \"AMBIGUOUS_UNHYPHENATED\", \"NOT_FOUND\"]\n          }\n        },\n        \"required\": [\"generic_name\", \"strength_norm\", \"dosage_form\", \"ndc_raw\", \"ndc_11\", \"ndc_source_format\"]\n      }\n    },\n    \"distribution\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"nationwide\": { \"type\": \"boolean\" },\n        \"us_state_codes\": {\n          \"type\": \"array\",\n          \"items\": { \"type\": \"string\", \"description\": \"Two-letter USPS code, upper case\" }\n        }\n      },\n      \"required\": [\"nationwide\", \"us_state_codes\"]\n    },\n    \"supply_impact_summary\": { \"type\": \"string\", \"description\": \"One neutral factual sentence, max 200 characters\" }\n  },\n  \"required\": [\"products\", \"distribution\", \"supply_impact_summary\"]\n}",
+        "options": {
+          "systemPromptTemplate": "You are a pharmaceutical regulatory data-extraction engine for a US generic-injectables manufacturer. You read one FDA record (an Enforcement Report recall or a Drug Shortage listing) and return ONLY the structured fields requested. Accuracy beats completeness: never guess, never infer an NDC that is not printed in the text.\n\nPRODUCTS (one entry per distinct NDC printed in the text)\n1. generic_name: the active ingredient in lower case, keeping the salt form exactly as printed (examples: cisplatin, carboplatin, albuterol sulfate). No brand names, no dosage form words.\n2. strength_norm: upper case, no spaces, amount per volume as printed. Examples: 1MG/ML, 10MG/ML, 2.5MG/3ML, 400MG/5ML, 25MG/ML. If a percentage and an mg-per-volume value are both printed, use the mg-per-volume value. Use MCG for micrograms.\n3. dosage_form: upper case (examples: INJECTION, INHALATION SOLUTION, POWDER FOR ORAL SUSPENSION).\n4. ndc_raw: copy the NDC exactly as printed, character for character, including hyphens, without the word NDC. If no NDC is printed, return an empty string.\n5. ndc_11: convert ndc_raw to the HIPAA 11-digit 5-4-2 format with hyphens by adding ONE leading zero to the short segment:\n   - 4-4-2 (example 1234-5678-90) becomes 01234-5678-90\n   - 5-3-2 (example 12345-678-90) becomes 12345-0678-90\n   - 5-4-1 (example 12345-6789-0) becomes 12345-6789-00\n   - 5-4-2 is already correct; keep it.\n   If ndc_raw is 10 digits WITHOUT hyphens, the configuration is ambiguous: return an empty string for ndc_11 and set ndc_source_format to AMBIGUOUS_UNHYPHENATED. Never pad or split an ambiguous NDC.\n6. ndc_source_format: one of 4-4-2, 5-3-2, 5-4-1, 5-4-2, AMBIGUOUS_UNHYPHENATED, NOT_FOUND.\n\nDISTRIBUTION\n7. nationwide: true only if the text says nationwide, throughout the US, all states, or the source is the FDA national shortage list. Otherwise false.\n8. us_state_codes: two-letter USPS codes (upper case) for every US state, DC or PR named in the distribution pattern, converting full state names to codes (Texas becomes TX). Ignore foreign countries, cities and territories other than PR. If nationwide is true you may return an empty list.\n\nSUMMARY\n9. supply_impact_summary: one neutral, factual sentence (max 200 characters) describing the supply impact. Do not speculate about cause, liability or the company's quality systems.\n\nIf the text contains no human prescription drug product, return an empty products list."
+        }
+      },
+      "id": "a1ff5908-db4c-522c-b1c5-edf5e43deadd",
+      "name": "AI Information Extractor",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        300
+      ],
+      "notes": "Strict JSON schema: NDC-11 (5-4-2) + USPS states",
+      "notesInFlow": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-haiku-5-5"
+        },
+        "options": {
+          "temperature": 0,
+          "maxTokensToSample": 2048
+        }
+      },
+      "id": "68ddd752-bc0f-53ed-a191-68b6a7f298bf",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        1340,
+        520
+      ],
+      "notes": "Swap for OpenAI Chat Model if preferred",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── NDC & State QA Gate (deterministic, post-LLM) ───────────────────────────\n// The LLM proposes; this node decides. Every extracted product must pass:\n//   G1 Grounding   – the raw NDC string must appear verbatim in the FDA text\n//   G2 NDC rebuild – NDC-11 is recomputed with rules (not trusted from the LLM)\n//                    and must match ^\\d{5}-\\d{4}-\\d{2}$ (HIPAA 5-4-2)\n//   G3 States      – only valid USPS codes survive; at least one required\n//   G4 Product     – molecule present; strength in a normalized pattern\n// Failures are routed to QA quarantine (logged), never to Sales.\nconst NDC_11_RE = /^\\d{5}-\\d{4}-\\d{2}$/;\nconst STRENGTH_RE = /^\\d+(\\.\\d+)?(MG|MCG|G|MEQ|UNITS?|%)(\\/(\\d+(\\.\\d+)?)?(ML|L|G|ACTUATION|DOSE))?$/;\nconst US_51 = ['AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS',\n  'KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH',\n  'OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY'];\nconst VALID_STATES = new Set([...US_51, 'PR']);\n\n// 10-digit NDC (4-4-2 | 5-3-2 | 5-4-1) -> 11-digit 5-4-2 by zero-padding the short segment\nfunction normalizeNdc(raw) {\n  if (!raw) return { ndc11: null, format: 'NOT_FOUND' };\n  const s = String(raw).toUpperCase()\n    .replace(/[‐-―−]/g, '-')       // unicode dashes -> hyphen\n    .replace(/^\\s*NDC\\s*[:#]?\\s*/, '')\n    .replace(/\\s+/g, '');\n  const parts = s.split('-');\n  if (parts.length === 3 && parts.every((p) => /^\\d+$/.test(p))) {\n    const [a, b, c] = parts;\n    switch (`${a.length}-${b.length}-${c.length}`) {\n      case '4-4-2': return { ndc11: `0${a}-${b}-${c}`, format: '4-4-2' };\n      case '5-3-2': return { ndc11: `${a}-0${b}-${c}`, format: '5-3-2' };\n      case '5-4-1': return { ndc11: `${a}-${b}-0${c}`, format: '5-4-1' };\n      case '5-4-2': return { ndc11: `${a}-${b}-${c}`, format: '5-4-2' };\n      default:      return { ndc11: null, format: 'INVALID_SEGMENTS' };\n    }\n  }\n  const digits = s.replace(/\\D/g, '');\n  if (digits.length === 11) {\n    return { ndc11: `${digits.slice(0, 5)}-${digits.slice(5, 9)}-${digits.slice(9)}`, format: '11_UNHYPHENATED' };\n  }\n  // A bare 10-digit NDC cannot be split without knowing its configuration\n  if (digits.length === 10) return { ndc11: null, format: 'AMBIGUOUS_UNHYPHENATED' };\n  return { ndc11: null, format: 'INVALID' };\n}\n\nconst normStrength = (s) => String(s || '').toUpperCase()\n  .replace(/\\s+/g, '')\n  .replace(/[µμΜ]G/g, 'MCG')\n  .replace(/(^|[^A-Z])UG/g, '$1MCG');\nconst compact = (s) => String(s || '').toUpperCase().replace(/[\\s‐-―−-]/g, '');\n\nconst srcItems = $('Normalize & Pre-Filter Events').all();\nconst out = [];\n\n$input.all().forEach((item, i) => {\n  let src;\n  try { src = $('Normalize & Pre-Filter Events').itemMatching(i).json; }\n  catch (e) { src = srcItems[i].json; }\n\n  const x = item.json.output || {};\n  const dist = x.distribution || {};\n  const base = {\n    run_id: src.run_id,\n    source_type: src.source_type,\n    source_event_id: src.source_event_id,\n    recall_classification: src.recall_classification,\n    recalling_firm: src.recalling_firm,\n    reason: src.reason,\n  };\n\n  // ── G3: states ────────────────────────────────────────────────────────────\n  const rawStates = (dist.us_state_codes || []).map((c) => String(c).trim().toUpperCase());\n  const droppedStates = rawStates.filter((c) => !VALID_STATES.has(c));\n  const nationwide = dist.nationwide === true || src.source_type === 'FDA_SHORTAGE';\n  const states = nationwide ? [...US_51, 'PR'] : [...new Set(rawStates.filter((c) => VALID_STATES.has(c)))];\n\n  const products = Array.isArray(x.products) ? x.products : [];\n  const quarantine = (reasons, p = {}) => {\n    const ndcRaw = p.ndc_raw || 'NO-NDC';\n    out.push({ json: {\n      ...base, qa_passed: false, qa_notes: reasons.join('; '),\n      molecule_name: (p.generic_name || '').toLowerCase() || null,\n      ndc_raw: p.ndc_raw || null,\n      log_record: {\n        dedup_key: `${src.source_event_id}|${ndcRaw}|QA`,\n        run_id: src.run_id, source_type: src.source_type, source_event_id: src.source_event_id,\n        recall_classification: src.recall_classification, recalling_firm: src.recalling_firm,\n        external_ndc_11: null, molecule_name: (p.generic_name || '').toLowerCase() || null,\n        strength_norm: normStrength(p.strength_norm) || null,\n        affected_states: states.length ? states : null,\n        decision_status: 'QA_QUARANTINE', qa_notes: reasons.join('; '),\n      },\n    } });\n  };\n\n  if (item.json.error || !item.json.output) { quarantine(['LLM_EXTRACTION_FAILED']); return; }\n  if (!products.length) { quarantine(['NO_PRODUCT_EXTRACTED']); return; }\n\n  // Group passing products by molecule + strength (one commercial signal each)\n  const passed = new Map();\n\n  for (const p of products) {\n    const reasons = [];\n    const notes = [];\n\n    // ── G1 + G2: NDC ────────────────────────────────────────────────────────\n    const det = normalizeNdc(p.ndc_raw);\n    if (!p.ndc_raw) reasons.push('NDC_NOT_FOUND');\n    else if (!compact(src.llm_input_text).includes(compact(p.ndc_raw))) reasons.push('NDC_NOT_GROUNDED_IN_SOURCE');\n    if (p.ndc_raw && !det.ndc11) reasons.push(`NDC_UNRESOLVABLE:${det.format}`);\n    if (det.ndc11 && !NDC_11_RE.test(det.ndc11)) reasons.push('NDC_FAILED_542_REGEX');\n    const llmNdc = String(p.ndc_11 || '').trim();\n    if (det.ndc11 && llmNdc !== det.ndc11) notes.push(`LLM_NDC_CORRECTED:${llmNdc || 'blank'}->${det.ndc11}`);\n\n    // ── G4: product attributes ──────────────────────────────────────────────\n    const molecule = String(p.generic_name || '').trim().toLowerCase();\n    const strength = normStrength(p.strength_norm);\n    if (!/^[a-z0-9][a-z0-9 \\-]+$/.test(molecule)) reasons.push('MOLECULE_INVALID');\n    if (!STRENGTH_RE.test(strength)) reasons.push(`STRENGTH_UNPARSEABLE:${strength || 'blank'}`);\n\n    // ── G3: geography ───────────────────────────────────────────────────────\n    if (!states.length) reasons.push('NO_VALID_US_STATES');\n    if (droppedStates.length) notes.push(`DROPPED_INVALID_STATES:${droppedStates.join(',')}`);\n\n    if (reasons.length) { quarantine([...reasons, ...notes], p); continue; }\n\n    const key = `${molecule}|${strength}`;\n    if (!passed.has(key)) {\n      passed.set(key, { molecule, strength, dosage_form: p.dosage_form || '', ndcs: [], notes: [] });\n    }\n    const g = passed.get(key);\n    g.ndcs.push(det.ndc11);\n    g.notes.push(...notes);\n  }\n\n  for (const g of passed.values()) {\n    out.push({ json: {\n      ...base,\n      qa_passed: true,\n      qa_key: `${src.source_event_id}|${g.molecule}|${g.strength}`,\n      molecule_name: g.molecule,\n      strength_norm: g.strength,\n      dosage_form: g.dosage_form,\n      external_ndc_11: g.ndcs[0],\n      external_ndcs: [...new Set(g.ndcs)].join(', '),\n      nationwide,\n      affected_states: states,\n      affected_states_pipe: states.join('|'),\n      qa_notes: [...new Set(g.notes)].join('; ') || null,\n      supply_impact_summary: x.supply_impact_summary || '',\n    } });\n  }\n});\n\nreturn out;"
+      },
+      "id": "40487764-95cb-5060-8fa7-e69bf49c28d2",
+      "name": "NDC & State QA Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        300
+      ],
+      "notes": "Deterministic regex + grounding checks",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "078efff7-d418-5052-a247-364b16c34fbc",
+              "leftValue": "={{ $json.qa_passed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cada7fe0-fb92-557c-b2f2-5d2092ece85e",
+      "name": "QA Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Match one QA-passed shortage signal to our ERP inventory and GPO demand.\n-- $1 molecule  $2 strength_norm  $3 states (pipe-delimited USPS codes)\n-- $4 qa_key    $5 external NDC-11  $6 source_event_id\nWITH p AS (\n  SELECT lower($1::text)                 AS molecule,\n         upper($2::text)                 AS strength_norm,\n         string_to_array($3::text, '|')  AS states,\n         $4::text                        AS qa_key,\n         $5::text                        AS ext_ndc,\n         $6::text                        AS source_event_id\n),\nown_product_guard AS (   -- never treat a recall/shortage of OUR OWN labeler code as an opportunity\n  SELECT EXISTS (SELECT 1 FROM internal_sku_inventory i, p\n                 WHERE i.labeler_code = left(p.ext_ndc, 5)) AS is_own_product\n),\ntarget_demand AS (       -- competitor-awarded / secondary accounts inside the affected footprint\n  SELECT g.sku_id,\n         COUNT(*)                         AS target_account_count,\n         SUM(g.avg_monthly_units)         AS target_monthly_units,\n         string_agg(g.account_name || ' (' || g.state_code || ', ' || g.gpo_name || ')', '; '\n                    ORDER BY g.avg_monthly_units DESC) AS target_accounts,\n         string_agg(DISTINCT g.kam_name, ', ') AS kam_owners\n  FROM regional_gpo_accounts g, p\n  WHERE g.our_contract_status IN ('SECONDARY', 'NOT_AWARDED')\n    AND g.state_code = ANY (p.states)\n  GROUP BY g.sku_id\n)\nSELECT p.qa_key,\n       p.source_event_id,\n       s.sku_id,\n       s.ndc_11                              AS our_ndc_11,\n       s.sku_description,\n       s.molecule_name,\n       s.strength_norm,\n       s.sell_unit,\n       s.on_hand_units,\n       s.committed_units,\n       s.wac_per_unit,\n       s.earliest_expiry,\n       COALESCE(t.target_account_count, 0)  AS target_account_count,\n       COALESCE(t.target_monthly_units, 0)  AS target_monthly_units,\n       COALESCE(t.target_accounts, '')      AS target_accounts,\n       COALESCE(t.kam_owners, '')           AS kam_owners\nFROM p\nJOIN internal_sku_inventory s\n  ON lower(s.molecule_name) = p.molecule\n AND upper(s.strength_norm) = p.strength_norm\n AND s.is_active\nLEFT JOIN target_demand t ON t.sku_id = s.sku_id\nWHERE NOT (SELECT is_own_product FROM own_product_guard)\n  AND NOT EXISTS (       -- de-dup: never pitch the same event x SKU twice\n        SELECT 1 FROM shortage_opportunity_log l\n        WHERE l.dedup_key = p.qa_key || '|' || s.sku_id\n          AND l.decision_status = 'PITCH_DISPATCHED')\nORDER BY s.sku_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.molecule_name, $json.strength_norm, $json.affected_states_pipe, $json.qa_key, $json.external_ndc_11, $json.source_event_id ] }}"
+        }
+      },
+      "id": "101e9b0c-4438-5a68-9b02-2c6a16506012",
+      "name": "Match ERP Inventory & GPO Demand",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2060,
+        180
+      ],
+      "notes": "Parameterized SQL; own-labeler guard; de-dup",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Upsert one decision into the audit log. $1 = JSON log_record built by the workflow.\n-- A PITCH_DISPATCHED row is never overwritten; other statuses are refreshed.\nINSERT INTO shortage_opportunity_log (\n  dedup_key, run_id, source_type, source_event_id, recall_classification, recalling_firm,\n  external_ndc_11, molecule_name, strength_norm, affected_states, sku_id,\n  on_hand_units, committed_units, fts_buffer_units, spot_eligible_units, target_monthly_units,\n  addressable_units, wac_per_unit, spot_price_per_unit, net_spot_revenue_usd,\n  target_account_count, decision_status, qa_notes)\nSELECT\n  r.dedup_key, r.run_id, r.source_type, r.source_event_id, r.recall_classification, r.recalling_firm,\n  r.external_ndc_11, r.molecule_name, r.strength_norm, r.affected_states, r.sku_id,\n  r.on_hand_units, r.committed_units, r.fts_buffer_units, r.spot_eligible_units, r.target_monthly_units,\n  r.addressable_units, r.wac_per_unit, r.spot_price_per_unit, r.net_spot_revenue_usd,\n  r.target_account_count, r.decision_status, r.qa_notes\nFROM jsonb_populate_record(NULL::shortage_opportunity_log, $1::jsonb) AS r\nON CONFLICT (dedup_key) DO UPDATE SET\n  run_id               = EXCLUDED.run_id,\n  on_hand_units        = EXCLUDED.on_hand_units,\n  committed_units      = EXCLUDED.committed_units,\n  fts_buffer_units     = EXCLUDED.fts_buffer_units,\n  spot_eligible_units  = EXCLUDED.spot_eligible_units,\n  target_monthly_units = EXCLUDED.target_monthly_units,\n  addressable_units    = EXCLUDED.addressable_units,\n  wac_per_unit         = EXCLUDED.wac_per_unit,\n  spot_price_per_unit  = EXCLUDED.spot_price_per_unit,\n  net_spot_revenue_usd = EXCLUDED.net_spot_revenue_usd,\n  target_account_count = EXCLUDED.target_account_count,\n  decision_status      = EXCLUDED.decision_status,\n  qa_notes             = EXCLUDED.qa_notes,\n  updated_at           = now()\nWHERE shortage_opportunity_log.decision_status <> 'PITCH_DISPATCHED'\nRETURNING log_id, dedup_key, decision_status, net_spot_revenue_usd;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.log_record) ] }}"
+        }
+      },
+      "id": "80323dc5-4de3-5896-a666-ba21c47fde22",
+      "name": "Log QA Quarantine",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2060,
+        480
+      ],
+      "notes": "Human review queue (status QA_QUARANTINE)",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── BA Spot-Buy Sizing (deterministic commercial logic — no LLM) ────────────\n// Per matched SKU:\n//   fts_buffer_units     = CEIL(committed_units × 15%)\n//   protected_units      = committed_units + fts_buffer_units\n//   spot_eligible_units  = MAX(0, on_hand_units − protected_units)\n//   addressable_units    = MIN(spot_eligible_units, target_monthly_units × months_of_cover)\n//   spot_price_per_unit  = ROUND(WAC × (1 − 12%), 2)\n//   net_spot_revenue_usd = addressable_units × spot_price_per_unit\n// Decision: ≥ $50k → PITCH_DISPATCHED | eligible = 0 → FTS_PROTECTED_NO_CAPACITY | else BELOW_THRESHOLD\nconst CFG = {\n  SPOT_DISCOUNT_PCT: 0.12,     // spot price = WAC − 12% (below WAC by design: no shortage price-gouging)\n  FTS_BUFFER_PCT: 0.15,        // safety stock held above GPO-committed volume\n  MONTHS_OF_COVER: 1,          // size the pitch to one month of target-account demand\n  MIN_NET_REVENUE_USD: 50000,  // keep in sync with the \"Net Revenue ≥ $50k?\" If node\n};\n\nconst qaByKey = new Map($('NDC & State QA Gate').all().map((i) => [i.json.qa_key, i.json]));\nconst round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;\nconst int = (v) => Math.trunc(Number(v) || 0);                      // pg returns BIGINT as text\nconst money = (n) => '$' + Number(n).toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');\nconst qty = (n) => String(n).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');\n\nreturn $input.all().map((item) => {\n  const m = item.json;\n  const ev = qaByKey.get(m.qa_key) || {};\n\n  const onHand = int(m.on_hand_units);\n  const committed = int(m.committed_units);\n  const wac = Number(m.wac_per_unit);                              // pg returns NUMERIC as text\n  const targetMonthly = int(m.target_monthly_units);\n\n  const ftsBuffer = Math.ceil(committed * CFG.FTS_BUFFER_PCT);\n  const protectedUnits = committed + ftsBuffer;\n  const spotEligible = Math.max(0, onHand - protectedUnits);\n  const demandCap = Math.round(targetMonthly * CFG.MONTHS_OF_COVER);\n  const addressable = Math.min(spotEligible, demandCap);\n  const spotPrice = round2(wac * (1 - CFG.SPOT_DISCOUNT_PCT));\n  const netRevenue = round2(addressable * spotPrice);\n\n  const meetsThreshold = netRevenue >= CFG.MIN_NET_REVENUE_USD;\n  const decision = meetsThreshold ? 'PITCH_DISPATCHED'\n    : spotEligible === 0 ? 'FTS_PROTECTED_NO_CAPACITY'\n    : 'BELOW_THRESHOLD';\n\n  const footprint = ev.nationwide ? 'Nationwide' : (ev.affected_states || []).join(', ');\n  const trigger = ev.source_type === 'FDA_SHORTAGE'\n    ? `FDA Drug Shortage list · ${ev.recalling_firm}`\n    : `FDA Enforcement ${ev.source_event_id} · ${ev.recall_classification} · ${ev.recalling_firm}`;\n  const unit = String(m.sell_unit || 'unit').toLowerCase();\n  const title = String(m.molecule_name).replace(/\\b[a-z]/g, (c) => c.toUpperCase());\n\n  const slack_message = [\n    `:rotating_light: *Spot-Buy Opportunity: ${title} ${m.strength_norm}*`,\n    `*Trigger:* ${trigger}`,\n    `*Reason:* ${ev.reason || 'n/a'}`,\n    `*Footprint:* ${footprint}`,\n    '',\n    `*Our supply: ${m.sku_id}* (NDC ${m.our_ndc_11}) ${m.sku_description}`,\n    `• On hand ${qty(onHand)} · GPO-committed ${qty(committed)} · FTS buffer (15%) ${qty(ftsBuffer)}`,\n    `• Spot-eligible after FTS protection: ${qty(spotEligible)} ${unit}s`,\n    `• Addressable (1 month of target demand): ${qty(addressable)} ${unit}s`,\n    '',\n    `*Commercials:* spot ${money(spotPrice)}/${unit} (WAC ${money(wac)} − 12%)`,\n    `*Est. net spot revenue: ${money(netRevenue)}*`,\n    '',\n    `*Target accounts (${int(m.target_account_count)}):* ${m.target_accounts || 'none in footprint'}`,\n    `*KAM owners:* ${m.kam_owners || 'unassigned'}`,\n    '_Next step: Pricing & Contracts approval, then outreach with the MLR-approved shortage-response template only. Reference the public FDA record; make no other claims about the competitor._',\n  ].join('\\n');\n\n  return {\n    json: {\n      ...m,\n      source_type: ev.source_type,\n      recall_classification: ev.recall_classification,\n      recalling_firm: ev.recalling_firm,\n      external_ndc_11: ev.external_ndc_11,\n      affected_states: ev.affected_states,\n      fts_buffer_units: ftsBuffer,\n      protected_units: protectedUnits,\n      spot_eligible_units: spotEligible,\n      addressable_units: addressable,\n      spot_price_per_unit: spotPrice,\n      net_spot_revenue_usd: netRevenue,\n      meets_threshold: meetsThreshold,\n      decision_status: decision,\n      slack_message,\n      log_record: {\n        dedup_key: `${m.qa_key}|${m.sku_id}`,\n        run_id: ev.run_id,\n        source_type: ev.source_type,\n        source_event_id: ev.source_event_id,\n        recall_classification: ev.recall_classification,\n        recalling_firm: ev.recalling_firm,\n        external_ndc_11: ev.external_ndc_11,\n        molecule_name: m.molecule_name,\n        strength_norm: m.strength_norm,\n        affected_states: ev.affected_states,\n        sku_id: m.sku_id,\n        on_hand_units: onHand,\n        committed_units: committed,\n        fts_buffer_units: ftsBuffer,\n        spot_eligible_units: spotEligible,\n        target_monthly_units: targetMonthly,\n        addressable_units: addressable,\n        wac_per_unit: wac,\n        spot_price_per_unit: spotPrice,\n        net_spot_revenue_usd: netRevenue,\n        target_account_count: int(m.target_account_count),\n        decision_status: decision,\n        qa_notes: ev.qa_notes || null,\n      },\n    },\n  };\n});"
+      },
+      "id": "a7cfa30c-ec92-5e37-865c-628e5371b842",
+      "name": "BA Spot-Buy Sizing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2300,
+        180
+      ],
+      "notes": "WAC - 12% | 15% FTS buffer | 1 month cover",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d732fa7a-8e70-5313-a16e-be1965ef0262",
+              "leftValue": "={{ $json.net_spot_revenue_usd }}",
+              "rightValue": 50000,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3f34a66d-1b48-52d7-b3c6-784edf5816f9",
+      "name": "Net Revenue ≥ $50k?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2520,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#gpo-shortage-alerts"
+        },
+        "text": "={{ $json.slack_message }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "2ea76d01-b85f-53ca-97e4-9c393f1d099e",
+      "name": "Slack GPO Pitch Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2760,
+        60
+      ],
+      "notes": "Internal KAM alert, not customer-facing",
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Upsert one decision into the audit log. $1 = JSON log_record built by the workflow.\n-- A PITCH_DISPATCHED row is never overwritten; other statuses are refreshed.\nINSERT INTO shortage_opportunity_log (\n  dedup_key, run_id, source_type, source_event_id, recall_classification, recalling_firm,\n  external_ndc_11, molecule_name, strength_norm, affected_states, sku_id,\n  on_hand_units, committed_units, fts_buffer_units, spot_eligible_units, target_monthly_units,\n  addressable_units, wac_per_unit, spot_price_per_unit, net_spot_revenue_usd,\n  target_account_count, decision_status, qa_notes)\nSELECT\n  r.dedup_key, r.run_id, r.source_type, r.source_event_id, r.recall_classification, r.recalling_firm,\n  r.external_ndc_11, r.molecule_name, r.strength_norm, r.affected_states, r.sku_id,\n  r.on_hand_units, r.committed_units, r.fts_buffer_units, r.spot_eligible_units, r.target_monthly_units,\n  r.addressable_units, r.wac_per_unit, r.spot_price_per_unit, r.net_spot_revenue_usd,\n  r.target_account_count, r.decision_status, r.qa_notes\nFROM jsonb_populate_record(NULL::shortage_opportunity_log, $1::jsonb) AS r\nON CONFLICT (dedup_key) DO UPDATE SET\n  run_id               = EXCLUDED.run_id,\n  on_hand_units        = EXCLUDED.on_hand_units,\n  committed_units      = EXCLUDED.committed_units,\n  fts_buffer_units     = EXCLUDED.fts_buffer_units,\n  spot_eligible_units  = EXCLUDED.spot_eligible_units,\n  target_monthly_units = EXCLUDED.target_monthly_units,\n  addressable_units    = EXCLUDED.addressable_units,\n  wac_per_unit         = EXCLUDED.wac_per_unit,\n  spot_price_per_unit  = EXCLUDED.spot_price_per_unit,\n  net_spot_revenue_usd = EXCLUDED.net_spot_revenue_usd,\n  target_account_count = EXCLUDED.target_account_count,\n  decision_status      = EXCLUDED.decision_status,\n  qa_notes             = EXCLUDED.qa_notes,\n  updated_at           = now()\nWHERE shortage_opportunity_log.decision_status <> 'PITCH_DISPATCHED'\nRETURNING log_id, dedup_key, decision_status, net_spot_revenue_usd;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('BA Spot-Buy Sizing').item.json.log_record) ] }}"
+        }
+      },
+      "id": "91f04867-a571-5f83-80a7-5b7b8aa78878",
+      "name": "Log Opportunity Decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3000,
+        260
+      ],
+      "notes": "Audit trail + de-dup store",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "content": "## API Shortage & Competitor Recall Commercial Trigger\nDaily scan of openFDA recalls + shortages → AI extraction → deterministic QA → ERP inventory match → BA sizing → Slack pitch for GPO key-account managers.\n\n**Demo mode:** the two openFDA nodes carry pinned mock data, so a manual *Test workflow* run is reproducible. Scheduled (production) runs ignore pinned data and call the live API.\n\nSetup: Postgres credential (run `03_database_schema/schema.sql`), Anthropic or OpenAI credential, Slack credential + channel.",
+        "height": 300,
+        "width": 1100,
+        "color": 7
+      },
+      "id": "5f824d31-9f54-5d8b-a188-40cbea5b8152",
+      "name": "Note: Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### AI guardrails (LLM proposes, code decides)\n- Temperature 0 + strict JSON schema\n- **G1 Grounding:** raw NDC must appear verbatim in the FDA text\n- **G2 NDC rebuild:** 10-digit 4-4-2 / 5-3-2 / 5-4-1 → 11-digit 5-4-2 recomputed by rules; LLM value is only compared, never trusted\n- **G3 States:** USPS whitelist only\n- Unhyphenated 10-digit NDCs are ambiguous → quarantined, never guessed",
+        "height": 300,
+        "width": 760,
+        "color": 4
+      },
+      "id": "f5135c2c-aca0-5a6a-a2fc-c5a00500fc20",
+      "name": "Note: AI guardrails",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1260,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### BA sizing rules (deterministic)\n- FTS buffer = 15% × GPO-committed units (protects Failure-to-Supply clauses)\n- Spot-eligible = on hand − committed − buffer\n- Addressable = min(spot-eligible, 1 month of target-account demand)\n- Spot price = WAC − 12% → net revenue; pitch only if ≥ $50,000\n- Keep the threshold in the Code node and the If node in sync",
+        "height": 260,
+        "width": 700,
+        "color": 6
+      },
+      "id": "e1af2ef7-ca8b-56c3-8802-dc9366b0d70e",
+      "name": "Note: BA sizing",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        -220
+      ]
+    }
+  ],
+  "connections": {
+    "Daily Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Query Window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Query Window": {
+      "main": [
+        [
+          {
+            "node": "Load Portfolio Molecules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Portfolio Molecules": {
+      "main": [
+        [
+          {
+            "node": "OpenFDA Enforcement",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenFDA Enforcement": {
+      "main": [
+        [
+          {
+            "node": "OpenFDA Shortages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenFDA Shortages": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Pre-Filter Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Pre-Filter Events": {
+      "main": [
+        [
+          {
+            "node": "AI Information Extractor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Information Extractor": {
+      "main": [
+        [
+          {
+            "node": "NDC & State QA Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NDC & State QA Gate": {
+      "main": [
+        [
+          {
+            "node": "QA Passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Information Extractor",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QA Passed?": {
+      "main": [
+        [
+          {
+            "node": "Match ERP Inventory & GPO Demand",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log QA Quarantine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match ERP Inventory & GPO Demand": {
+      "main": [
+        [
+          {
+            "node": "BA Spot-Buy Sizing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BA Spot-Buy Sizing": {
+      "main": [
+        [
+          {
+            "node": "Net Revenue ≥ $50k?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Net Revenue ≥ $50k?": {
+      "main": [
+        [
+          {
+            "node": "Slack GPO Pitch Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Opportunity Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack GPO Pitch Alert": {
+      "main": [
+        [
+          {
+            "node": "Log Opportunity Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "OpenFDA Enforcement": [
+      {
+        "json": {
+          "meta": {
+            "disclaimer": "DEMO PIN DATA - fictitious records shaped like the openFDA /drug/enforcement.json response. Not real FDA data.",
+            "results": {
+              "skip": 0,
+              "limit": 1000,
+              "total": 5
+            }
+          },
+          "results": [
+            {
+              "recall_number": "D-9101-2026",
+              "event_id": "990101",
+              "status": "Ongoing",
+              "classification": "Class II",
+              "product_type": "Drugs",
+              "recalling_firm": "MOCK - Northwind Oncology Generics, LLC",
+              "city": "Princeton",
+              "state": "NJ",
+              "country": "United States",
+              "voluntary_mandated": "Voluntary: Firm initiated",
+              "initial_firm_notification": "Letter",
+              "product_description": "Cisplatin Injection, 1 mg/mL, 50 mL and 100 mL multiple-dose vials, Rx only, Manufactured for: MOCK - Northwind Oncology Generics, LLC, Princeton, NJ 08540. NDC 68123-411-05 (50 mL vial), NDC 68123-411-10 (100 mL vial)",
+              "product_quantity": "41,280 vials",
+              "reason_for_recall": "Presence of particulate matter: visible glass particles observed in retained samples.",
+              "code_info": "Lot #: NW26C117, NW26C118, Exp 06/2028",
+              "distribution_pattern": "Nationwide in the USA",
+              "recall_initiation_date": "20261023",
+              "center_classification_date": "20261029",
+              "report_date": "20261029",
+              "openfda": {}
+            },
+            {
+              "recall_number": "D-9102-2026",
+              "event_id": "990102",
+              "status": "Ongoing",
+              "classification": "Class I",
+              "product_type": "Drugs",
+              "recalling_firm": "MOCK - Bluewater Respiratory Inc.",
+              "city": "Sacramento",
+              "state": "CA",
+              "country": "United States",
+              "voluntary_mandated": "Voluntary: Firm initiated",
+              "initial_firm_notification": "Two or more of the following: Email, Fax, Letter, Press Release, Telephone, Visit",
+              "product_description": "Albuterol Sulfate Inhalation Solution, 0.083%, 2.5 mg/3 mL, 25 x 3 mL unit-dose vials per carton, Rx only, Bluewater Respiratory Inc. NDC 0919-3305-25",
+              "product_quantity": "18,600 cartons",
+              "reason_for_recall": "Lack of Assurance of Sterility: microbial contamination identified during stability testing.",
+              "code_info": "Lot #: BW2609A through BW2614A, Exp 09/2027",
+              "distribution_pattern": "Distributed to wholesalers and hospitals in CA, NV, AZ, OR and Washington.",
+              "recall_initiation_date": "20261027",
+              "center_classification_date": "20261030",
+              "report_date": "20261030",
+              "openfda": {}
+            },
+            {
+              "recall_number": "D-9103-2026",
+              "event_id": "990103",
+              "status": "Ongoing",
+              "classification": "Class II",
+              "product_type": "Drugs",
+              "recalling_firm": "MOCK - Harborview Injectables Inc.",
+              "city": "Houston",
+              "state": "TX",
+              "country": "United States",
+              "voluntary_mandated": "Voluntary: Firm initiated",
+              "initial_firm_notification": "Letter",
+              "product_description": "Methotrexate Injection USP, 25 mg/mL, 2 mL single-dose vial, Rx only, Harborview Injectables Inc., NDC 5512345678",
+              "product_quantity": "9,950 vials",
+              "reason_for_recall": "Failed impurities/degradation specifications.",
+              "code_info": "Lot #: HV-0926, Exp 03/2027",
+              "distribution_pattern": "TX and OK",
+              "recall_initiation_date": "20261026",
+              "center_classification_date": "20261030",
+              "report_date": "20261030",
+              "openfda": {}
+            },
+            {
+              "recall_number": "D-9104-2026",
+              "event_id": "990104",
+              "status": "Ongoing",
+              "classification": "Class II",
+              "product_type": "Drugs",
+              "recalling_firm": "MOCK - Summit Oral Solids Ltd.",
+              "city": "Raleigh",
+              "state": "NC",
+              "country": "United States",
+              "voluntary_mandated": "Voluntary: Firm initiated",
+              "initial_firm_notification": "Letter",
+              "product_description": "Atorvastatin Calcium Tablets USP, 40 mg, 90-count bottle, Rx only, NDC 60219-1102-09",
+              "product_quantity": "22,000 bottles",
+              "reason_for_recall": "Failed dissolution specifications.",
+              "code_info": "Lot #: SO-4471, Exp 12/2027",
+              "distribution_pattern": "Nationwide in the USA",
+              "recall_initiation_date": "20261024",
+              "center_classification_date": "20261029",
+              "report_date": "20261029",
+              "openfda": {}
+            },
+            {
+              "recall_number": "D-9105-2026",
+              "event_id": "990105",
+              "status": "Ongoing",
+              "classification": "Class III",
+              "product_type": "Drugs",
+              "recalling_firm": "MOCK - Northwind Oncology Generics, LLC",
+              "city": "Princeton",
+              "state": "NJ",
+              "country": "United States",
+              "voluntary_mandated": "Voluntary: Firm initiated",
+              "initial_firm_notification": "Letter",
+              "product_description": "Fluorouracil Injection, 50 mg/mL, 10 mL vial, Rx only, NDC 68123-0731-10",
+              "product_quantity": "3,100 vials",
+              "reason_for_recall": "Labeling: incorrect expiration date format on carton.",
+              "code_info": "Lot #: NW26F002",
+              "distribution_pattern": "Nationwide",
+              "recall_initiation_date": "20261025",
+              "center_classification_date": "20261030",
+              "report_date": "20261030",
+              "openfda": {}
+            }
+          ]
+        }
+      }
+    ],
+    "OpenFDA Shortages": [
+      {
+        "json": {
+          "meta": {
+            "disclaimer": "DEMO PIN DATA - fictitious records shaped like the openFDA /drug/shortages.json response. Not real FDA data.",
+            "results": {
+              "skip": 0,
+              "limit": 1000,
+              "total": 3
+            }
+          },
+          "results": [
+            {
+              "generic_name": "Carboplatin Injection",
+              "company_name": "MOCK - Northwind Oncology Generics, LLC",
+              "status": "Current",
+              "availability": "Unavailable",
+              "update_type": "New",
+              "presentation": "Carboplatin Injection, 10 mg/mL, 45 mL multiple-dose vial (NDC 68123-5502-1)",
+              "package_ndc": "68123-5502-1",
+              "dosage_form": "Injection",
+              "therapeutic_category": [
+                "Oncology"
+              ],
+              "shortage_reason": "Delay in shipping of the drug",
+              "related_info": "Estimated recovery: Q1 2027",
+              "initial_posting_date": "10/30/2026",
+              "update_date": "10/30/2026",
+              "openfda": {}
+            },
+            {
+              "generic_name": "Lidocaine Hydrochloride Injection",
+              "company_name": "MOCK - Meridian Generics (our own product)",
+              "status": "Current",
+              "availability": "Limited Availability",
+              "update_type": "Revised",
+              "presentation": "Lidocaine HCl Injection, 1% (10 mg/mL), 30 mL multiple-dose vial (NDC 71999-0420-30)",
+              "package_ndc": "71999-0420-30",
+              "dosage_form": "Injection",
+              "therapeutic_category": [
+                "Anesthesia"
+              ],
+              "shortage_reason": "Demand increase for the drug",
+              "related_info": "Allocation in place",
+              "initial_posting_date": "09/12/2026",
+              "update_date": "10/31/2026",
+              "openfda": {}
+            },
+            {
+              "generic_name": "Isocarboxazid Tablet",
+              "company_name": "MOCK - Lakeview Specialty Rx",
+              "status": "Current",
+              "availability": "Limited Availability",
+              "update_type": "Revised",
+              "presentation": "Isocarboxazid Tablet, 10 mg, 100 count bottle (NDC 70144-032-01)",
+              "package_ndc": "70144-032-01",
+              "dosage_form": "Tablet",
+              "therapeutic_category": [
+                "Psychiatry"
+              ],
+              "shortage_reason": "Other",
+              "initial_posting_date": "04/16/2026",
+              "update_date": "10/28/2026",
+              "openfda": {}
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
