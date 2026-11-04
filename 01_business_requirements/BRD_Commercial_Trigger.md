@@ -4,6 +4,7 @@
 | Document control | |
 |---|---|
 | **Document ID** | BRD-CT-001 |
+| **Copyright** | © 2026 Banibrata. All rights reserved. See [LICENSE](../LICENSE). |
 | **Version** | 1.0 |
 | **Date** | 04-Nov-2026 |
 | **Author** | Banibrata, Business Analyst |

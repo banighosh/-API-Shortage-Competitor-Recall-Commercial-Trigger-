@@ -1,6 +1,7 @@
 -- =============================================================================
 --  API Shortage & Competitor Recall Commercial Trigger
 --  03_database_schema/schema.sql
+--  © 2026 Banibrata. All rights reserved. See LICENSE in the repository root.
 --
 --  Target   : PostgreSQL 13+ (tested on PostgreSQL 16)
 --  Purpose  : Mock ERP / CRM / audit tables that the n8n workflow queries.

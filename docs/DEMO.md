@@ -91,3 +91,7 @@ A recorded end-to-end run of the workflow, plus a talk track for presenting it i
 5. Close any tab that shows API keys or tokens before you share your screen.
 
 **Tested configuration (Nov 2026):** n8n self-hosted, Google Gemini 3.5 Flash Lite (free tier, temperature 0) as the extractor model, Supabase PostgreSQL via the session pooler, Slack bot with `chat:write` posting to a channel set by ID.
+
+---
+
+© 2026 Banibrata. All rights reserved. See [LICENSE](../LICENSE).

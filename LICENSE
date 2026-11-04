@@ -1,0 +1,38 @@
+Copyright (c) 2026 Banibrata (GitHub: @banighosh). All rights reserved.
+
+API Shortage & Competitor Recall Commercial Trigger
+
+This repository, including its documentation, business requirements, workflow
+design, source code, database schema, mock data, diagrams, images and
+recordings (together, the "Work"), is the proprietary work of the copyright
+holder and is published for portfolio and evaluation purposes only.
+
+PERMITTED USE
+You may view and read the Work on GitHub, and run it privately, solely to
+evaluate the author's skills (for example, as part of a hiring or review
+process). GitHub's Terms of Service also apply to this public repository.
+
+NOT PERMITTED WITHOUT PRIOR WRITTEN PERMISSION
+  - copying, reproducing or republishing the Work, in whole or in part;
+  - modifying the Work or creating derivative works based on it;
+  - distributing, sublicensing or selling the Work;
+  - using the Work, or any part of it, for commercial purposes, client
+    engagements, training material or presentations;
+  - presenting the Work, or a substantially similar design, as your own.
+
+Requests for permission: contact the author via GitHub (@banighosh).
+
+THIRD-PARTY MATERIAL
+  - openFDA data is a public U.S. government resource and is not claimed by
+    the author. It is provided without validation and is not for clinical use.
+  - n8n, PostgreSQL, Supabase, Slack, Google Gemini, Anthropic, OpenAI,
+    Vizient, Premier and HealthTrust are names and trademarks of their
+    respective owners and are referenced for identification only. No
+    affiliation or endorsement is implied.
+  - All companies, accounts, products, NDCs, prices and FDA records in the
+    mock data are fictitious.
+
+NO WARRANTY
+The Work is provided "as is", without warranty of any kind. It is not medical,
+legal, pricing or regulatory advice. In no event shall the author be liable
+for any claim, damages or other liability arising from the Work or its use.

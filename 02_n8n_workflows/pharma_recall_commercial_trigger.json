@@ -378,7 +378,7 @@
     },
     {
       "parameters": {
-        "content": "## API Shortage & Competitor Recall Commercial Trigger\nDaily scan of openFDA recalls + shortages → AI extraction → deterministic QA → ERP inventory match → BA sizing → Slack pitch for GPO key-account managers.\n\n**Demo mode:** the two openFDA nodes carry pinned mock data, so a manual *Test workflow* run is reproducible. Scheduled (production) runs ignore pinned data and call the live API.\n\nSetup: Postgres credential (run `03_database_schema/schema.sql`), Anthropic or OpenAI credential, Slack credential + channel.",
+        "content": "## API Shortage & Competitor Recall Commercial Trigger\nDaily scan of openFDA recalls + shortages → AI extraction → deterministic QA → ERP inventory match → BA sizing → Slack pitch for GPO key-account managers.\n\n**Demo mode:** the two openFDA nodes carry pinned mock data, so a manual *Test workflow* run is reproducible. Scheduled (production) runs ignore pinned data and call the live API.\n\nSetup: Postgres credential (run `03_database_schema/schema.sql`), Anthropic or OpenAI credential, Slack credential + channel.\n\n© 2026 Banibrata. All rights reserved. Proprietary portfolio work; see LICENSE.",
         "height": 300,
         "width": 1100,
         "color": 7
@@ -799,7 +799,8 @@
     "saveManualExecutions": true
   },
   "meta": {
-    "templateCredsSetupCompleted": false
+    "templateCredsSetupCompleted": false,
+    "copyright": "© 2026 Banibrata. All rights reserved. Proprietary portfolio work; see LICENSE in the source repository."
   },
   "tags": []
 }

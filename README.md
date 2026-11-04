@@ -2,7 +2,7 @@
 
 **An n8n + GenAI workflow that turns public FDA recall and drug-shortage signals into sized, supply-safe spot-buy pitches for GPO key-account managers, in under a day instead of a week.**
 
-![n8n](https://img.shields.io/badge/orchestration-n8n-EA4B71) ![PostgreSQL](https://img.shields.io/badge/data-PostgreSQL-336791) ![LLM](https://img.shields.io/badge/AI-LLM%20extraction-6E56CF) ![Domain](https://img.shields.io/badge/domain-Pharma%20Commercial%20Ops-0A7E8C)
+![n8n](https://img.shields.io/badge/orchestration-n8n-EA4B71) ![PostgreSQL](https://img.shields.io/badge/data-PostgreSQL-336791) ![LLM](https://img.shields.io/badge/AI-LLM%20extraction-6E56CF) ![Domain](https://img.shields.io/badge/domain-Pharma%20Commercial%20Ops-0A7E8C) ![License](https://img.shields.io/badge/license-All%20Rights%20Reserved-B22222)
 
 > Portfolio project by **Banibrata** (Business Analyst, Health & Life Sciences). All company, account, inventory, pricing and FDA records in this repository are **fictitious** and exist for demonstration only.
 
@@ -197,6 +197,12 @@ The two openFDA nodes ship with **pinned mock data**, so a manual *Test workflow
 ## 9. Disclaimer
 
 This is a portfolio demonstration. It is not medical, legal or pricing advice, and it is not affiliated with or endorsed by the FDA. openFDA data is provided without validation and should not be used for clinical decisions. Any real deployment needs review by Pricing, Legal/Compliance and MLR.
+
+---
+
+## 10. License
+
+**© 2026 Banibrata. All rights reserved.** This is proprietary portfolio work. You may view it and run it privately to evaluate the author's skills. Copying, modification, redistribution or commercial use requires prior written permission. See [LICENSE](LICENSE) for the full terms. Third-party names and trademarks belong to their owners; openFDA data is public U.S. government data.
 
 ---
 
