@@ -6,6 +6,18 @@
 
 > Portfolio project by **Banibrata** (Business Analyst, Health & Life Sciences). All company, account, inventory, pricing and FDA records in this repository are **fictitious** and exist for demonstration only.
 
+## ▶ Live demo
+
+![End-to-end demo run](docs/demo/demo_run.gif)
+
+A recorded end-to-end run: n8n executes the workflow, **3 GPO pitches worth $222,724.60** post to Slack, and every decision (including one AI-quarantined record) lands in the PostgreSQL audit log.
+
+| Workflow run | Slack pitches | Decision log |
+|---|---|---|
+| ![n8n](docs/demo/01_n8n_workflow_run.png) | ![Slack](docs/demo/02_slack_gpo_pitches.png) | ![Log](docs/demo/03_decision_log_supabase.png) |
+
+**Presenting this project?** See the [Demo & Presentation Guide](docs/DEMO.md) for a 3-minute talk track and likely interview questions.
+
 ---
 
 ## 1. Executive summary
@@ -131,15 +143,18 @@ The two openFDA nodes ship with **pinned mock data**, so a manual *Test workflow
 │   └── BRD_Commercial_Trigger.md               ← formal BRD: FRs, business rules, UAT, traceability
 ├── 02_n8n_workflows/
 │   └── pharma_recall_commercial_trigger.json   ← importable n8n workflow (with demo pin data)
-└── 03_database_schema/
-    └── schema.sql                              ← PostgreSQL schema + realistic mock data
+├── 03_database_schema/
+│   └── schema.sql                              ← PostgreSQL schema + realistic mock data
+└── docs/
+    ├── DEMO.md                                 ← demo walkthrough + 3-minute talk track
+    └── demo/                                   ← recorded run (GIF) and screenshots
 ```
 
 ---
 
 ## 7. Quick start
 
-**Prerequisites:** n8n (Cloud or self-hosted, a recent 1.x release or later with the AI/LangChain nodes), a PostgreSQL 13+ database (local Docker, Supabase or Neon all work), an Anthropic or OpenAI API key and a Slack workspace.
+**Prerequisites:** n8n (Cloud or self-hosted, a recent 1.x release or later with the AI/LangChain nodes), a PostgreSQL 13+ database (local Docker, Supabase or Neon all work), an LLM API key (Anthropic, OpenAI or a free Google Gemini key) and a Slack workspace.
 
 1. **Create the database**
    ```bash
@@ -147,9 +162,9 @@ The two openFDA nodes ship with **pinned mock data**, so a manual *Test workflow
    ```
 2. **Import the workflow.** In n8n: *Workflows → Import from File →* `02_n8n_workflows/pharma_recall_commercial_trigger.json`.
 3. **Attach credentials.**
-   - **Postgres:** the four Postgres nodes (Load Portfolio, Match ERP, Log QA Quarantine, Log Opportunity Decision).
-   - **LLM:** *Anthropic Chat Model* (set to `claude-haiku-5-5`; pick any current model from the list). To use OpenAI instead, delete it, add an **OpenAI Chat Model** sub-node and connect it to the extractor's *Model* port with temperature 0.
-   - **Slack:** a bot token with `chat:write`. Invite the bot to `#gpo-shortage-alerts`, or choose another channel in the Slack node.
+   - **Postgres:** the four Postgres nodes (Load Portfolio, Match ERP, Log QA Quarantine, Log Opportunity Decision). On Supabase, use the *Session pooler* host and turn on **Ignore SSL Issues** (Supabase uses its own certificate authority).
+   - **LLM:** *Anthropic Chat Model* (set to `claude-haiku-5-5`; pick any current model from the list). To use another provider, delete it and connect an **OpenAI Chat Model** or **Google Gemini Chat Model** sub-node to the extractor's *Model* port with temperature 0. The recorded demo used **Gemini 3.5 Flash Lite** on the free tier.
+   - **Slack:** a bot token with `chat:write` and `chat:write.public`. Create a public `#gpo-shortage-alerts` channel and, if posting by name fails, set the Slack node's channel **By ID** (the `C…` ID in the channel's URL).
 4. **Run the demo.** Click **Test workflow**. Expect 3 Slack messages and the rows above in `shortage_opportunity_log`:
    ```sql
    SELECT * FROM v_opportunity_pipeline;
